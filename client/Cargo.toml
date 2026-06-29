@@ -1,0 +1,11 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared" }
+bincode = "1"
+rand = "0.8"
+hex = "0.4"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
