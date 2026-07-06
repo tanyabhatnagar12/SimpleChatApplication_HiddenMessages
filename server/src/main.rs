@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ADDR: &str = "127.0.0.1:6000";
 
-// Must match the client constant exactly.
-const HIDDEN_KEY: &[u8] = b"h1dd3n_x0r_k3y!";
-const HIDDEN_FLAG: u64  = 1u64 << 63;
+// Sentinel bit — server can detect a hidden payload exists but cannot read it.
+// The hidden content is encrypted with the DH shared key which the server never holds.
+const HIDDEN_FLAG: u64 = 1u64 << 63;
 
 fn now() -> String {
     let secs = SystemTime::now()
@@ -21,35 +21,6 @@ fn now() -> String {
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     format!("{:02}:{:02}:{:02}", h, m, s)
-}
-
-fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
-    data.iter()
-        .enumerate()
-        .map(|(i, b)| b ^ key[i % key.len()])
-        .collect()
-}
-
-/// Decode a hex string to bytes without any external crate.
-fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    s.as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            let hi = (pair[0] as char).to_digit(16)? as u8;
-            let lo = (pair[1] as char).to_digit(16)? as u8;
-            Some((hi << 4) | lo)
-        })
-        .collect()
-}
-
-/// Decode the hidden payload from the content field.
-fn decode_hidden(hex_str: &str) -> Option<String> {
-    let bytes = from_hex(hex_str)?;
-    let plain = xor_cipher(&bytes, HIDDEN_KEY);
-    String::from_utf8(plain).ok()
 }
 
 fn log_route(msg: &Message) {
@@ -71,30 +42,18 @@ fn log_route(msg: &Message) {
         Payload::Empty => String::from("empty"),
     };
 
-    // Base routing log
     println!(
         "[{}] [{}] {} -> {}  ({})",
         now(), kind_tag, msg.from, msg.to, payload_info
     );
 
-    // If the sentinel bit is set, decode and log the real hidden message
+    // Server knows a hidden payload is present but cannot decrypt it —
+    // it is XOR'd with the DH shared key that only the two clients hold.
     if msg.kind == MessageKind::Msg && (msg.timestamp & HIDDEN_FLAG) != 0 {
-        if let Some(ref hex_str) = msg.content {
-            match decode_hidden(hex_str) {
-                Some(plain) => {
-                    println!(
-                        "[{}] [HIDDEN] {} -> {} : \"{}\"",
-                        now(), msg.from, msg.to, plain
-                    );
-                }
-                None => {
-                    println!(
-                        "[{}] [HIDDEN] {} -> {} : <decode failed>",
-                        now(), msg.from, msg.to
-                    );
-                }
-            }
-        }
+        println!(
+            "[{}] [HIDDEN] {} -> {} : <encrypted with DH key — unreadable by server>",
+            now(), msg.from, msg.to
+        );
     }
 }
 
@@ -146,7 +105,6 @@ fn main() {
         }
 
         while let Ok(msg) = rx.try_recv() {
-            // log_route now handles both normal and hidden message logging
             log_route(&msg);
 
             if let Some(stream) = clients.get_mut(&msg.to) {

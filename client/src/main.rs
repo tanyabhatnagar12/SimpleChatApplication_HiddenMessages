@@ -10,10 +10,6 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 const ADDR: &str = "127.0.0.1:6000";
 
-// Separate XOR key for hidden messages (known to all clients, separate from DH key).
-// In production you'd derive this from the DH shared secret too.
-const HIDDEN_KEY: &[u8] = b"h1dd3n_x0r_k3y!";
-
 // Bit 63 of timestamp = hidden-message sentinel
 const HIDDEN_FLAG: u64 = 1u64 << 63;
 
@@ -25,7 +21,6 @@ fn unix_now() -> u64 {
 }
 
 fn fmt_ts(unix: u64) -> String {
-    // Strip sentinel before display
     let secs = unix & !HIDDEN_FLAG;
     let h = (secs % 86400) / 3600;
     let m = (secs % 3600) / 60;
@@ -40,25 +35,35 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Encode a hidden payload: XOR with HIDDEN_KEY, then hex-encode.
-fn encode_hidden(text: &str) -> String {
-    let cipher = xor_cipher(text.as_bytes(), HIDDEN_KEY);
-    hex::encode(cipher)
+/// Encode hidden text using the DH shared key + a fresh nonce.
+/// Returns "NONCE_HEX:CIPHER_HEX" so the receiver can split and decode.
+fn encode_hidden(text: &str, dh_key: &[u8]) -> String {
+    let mut nonce = [0u8; 8];
+    thread_rng().fill_bytes(&mut nonce);
+    let mut k = dh_key.to_vec();
+    k.extend(&nonce);
+    let cipher = xor_cipher(text.as_bytes(), &k);
+    format!("{}:{}", hex::encode(nonce), hex::encode(cipher))
 }
 
-/// Decode a hidden payload: hex-decode, then XOR with HIDDEN_KEY.
-fn decode_hidden(hex_str: &str) -> Option<String> {
-    let bytes = hex::decode(hex_str).ok()?;
-    let plain = xor_cipher(&bytes, HIDDEN_KEY);
+/// Decode hidden text using the DH shared key.
+/// Expects "NONCE_HEX:CIPHER_HEX" format.
+fn decode_hidden(encoded: &str, dh_key: &[u8]) -> Option<String> {
+    let (nonce_hex, cipher_hex) = encoded.split_once(':')?;
+    let nonce  = hex::decode(nonce_hex).ok()?;
+    let cipher = hex::decode(cipher_hex).ok()?;
+    let mut k  = dh_key.to_vec();
+    k.extend(&nonce);
+    let plain = xor_cipher(&cipher, &k);
     String::from_utf8(plain).ok()
 }
 
 fn print_menu() {
     println!("  Commands:");
-    println!("    @name <message>           send an encrypted message");
-    println!("    @name !<hidden> <visible>  send a message with an embedded hidden payload");
-    println!("      e.g.  @bob !meet at 9pm Let's catch up sometime");
-    println!("    :quit                     disconnect and exit");
+    println!("    @name <message>              send an encrypted message");
+    println!("    @name !<hidden> visible      send with a hidden payload (hidden from server too)");
+    println!("      e.g.  @bob !meet at 9pm> Let's catch up sometime");
+    println!("    :quit                        disconnect and exit");
     println!();
 }
 
@@ -94,10 +99,10 @@ fn main() {
     let shared: Arc<Mutex<HashMap<String, Vec<u8>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let pending_rx  = Arc::clone(&pending);
-    let shared_rx   = Arc::clone(&shared);
-    let my_name_rx  = my_name.clone();
-    let mut net     = stream.try_clone().unwrap();
+    let pending_rx = Arc::clone(&pending);
+    let shared_rx  = Arc::clone(&shared);
+    let my_name_rx = my_name.clone();
+    let mut net    = stream.try_clone().unwrap();
 
     thread::spawn(move || loop {
         match Message::recv_from(&mut net) {
@@ -151,19 +156,18 @@ fn main() {
                     // ── Encrypted message ─────────────────────────────────────
                     MessageKind::Msg => {
                         if let Payload::Encrypted { ref nonce_hex, ref cipher_hex } = msg.payload {
-                            if let Some(key) = shared_rx.lock().unwrap().get(&msg.from) {
-                                let nonce   = hex::decode(nonce_hex).unwrap();
-                                let cipher  = hex::decode(cipher_hex).unwrap();
-                                let mut k   = key.clone();
+                            if let Some(key) = shared_rx.lock().unwrap().get(&msg.from).cloned() {
+                                let nonce  = hex::decode(nonce_hex).unwrap();
+                                let cipher = hex::decode(cipher_hex).unwrap();
+                                let mut k  = key.clone();
                                 k.extend(&nonce);
                                 let plaintext = xor_cipher(&cipher, &k);
                                 let text = String::from_utf8_lossy(&plaintext).to_string();
 
-                                // Check for hidden payload in the content field.
-                                // The sentinel bit in timestamp tells us one is present.
+                                // Sentinel bit set → hidden payload present, decrypt with DH key
                                 if msg.timestamp & HIDDEN_FLAG != 0 {
-                                    if let Some(ref hidden_hex) = msg.content {
-                                        if let Some(hidden) = decode_hidden(hidden_hex) {
+                                    if let Some(ref encoded) = msg.content {
+                                        if let Some(hidden) = decode_hidden(encoded, &key) {
                                             println!(
                                                 "[{}] {}: {}",
                                                 fmt_ts(msg.timestamp), msg.from, text
@@ -214,24 +218,18 @@ fn main() {
         }
 
         if let Some(rest) = line.strip_prefix('@') {
-            // Split off the target name
             if let Some(space) = rest.find(' ') {
                 let target    = &rest[..space];
                 let remainder = rest[space + 1..].trim();
 
-                // ── Parse hidden syntax: @name !<hidden> <visible> ──────────
-                // The hidden part is everything between the leading '!' and the
-                // first '>' character; the visible part is everything after it.
+                // Parse hidden syntax: @name !<hidden text> visible text
                 let (visible_text, hidden_text): (&str, Option<&str>) =
                     if let Some(bang_rest) = remainder.strip_prefix('!') {
-                        // Expect format: !<hidden message> visible message
-                        // Delimited by the first '>' that closes the angle bracket.
                         if let Some(close) = bang_rest.find('>') {
                             let hidden  = &bang_rest[..close];
                             let visible = bang_rest[close + 1..].trim();
                             (visible, Some(hidden))
                         } else {
-                            // No closing '>': treat the whole thing as a normal message
                             eprintln!("Hidden syntax: @name !<hidden text> visible text");
                             continue;
                         }
@@ -239,7 +237,7 @@ fn main() {
                         (remainder, None)
                     };
 
-                // ── Ensure shared key exists ──────────────────────────────────
+                // Ensure shared key exists
                 if !shared.lock().unwrap().contains_key(target) {
                     let secret = EphemeralSecret::random_from_rng(thread_rng());
                     let pubkey = PublicKey::from(&secret);
@@ -265,23 +263,24 @@ fn main() {
                     continue;
                 }
 
-                // ── Encrypt visible payload with DH shared key ────────────────
                 let key = shared.lock().unwrap().get(target).unwrap().clone();
+
+                // Encrypt visible payload with DH key
                 let mut nonce = [0u8; 8];
                 thread_rng().fill_bytes(&mut nonce);
                 let mut k = key.clone();
                 k.extend(&nonce);
                 let cipher = xor_cipher(visible_text.as_bytes(), &k);
 
-                // ── Build timestamp: set hidden sentinel if needed ────────────
+                // Timestamp: set sentinel bit if hidden payload present
                 let ts = if hidden_text.is_some() {
                     unix_now() | HIDDEN_FLAG
                 } else {
                     unix_now()
                 };
 
-                // ── Encode hidden payload into content field ──────────────────
-                let hidden_encoded = hidden_text.map(|h| encode_hidden(h));
+                // Encode hidden payload using DH key — server only sees opaque hex
+                let hidden_encoded = hidden_text.map(|h| encode_hidden(h, &key));
 
                 let chat_msg = Message {
                     kind:      MessageKind::Msg,
@@ -308,7 +307,7 @@ fn main() {
                     eprintln!("Send failed: {}", e);
                 }
             } else {
-                println!("Usage: @name <message>  or  @name !<hidden> visible");
+                println!("Usage: @name <message>  or  @name !<hidden text> visible text");
             }
         } else {
             println!("Unknown command. Use @name <message> or :quit");
